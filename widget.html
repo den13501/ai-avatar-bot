@@ -1,0 +1,422 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>AI Bot Widget</title>
+<style>
+  html, body { margin: 0; height: 100%; background: transparent; overflow: hidden;
+               font-family: "Noto Sans TC", system-ui, sans-serif; }
+  #stage { position: absolute; inset: 0; }
+  #avatar-canvas { width: 100%; height: 100%; display: block; }
+
+  #control-bar { position: absolute; left: 8px; bottom: 8px; display: flex; gap: 5px; align-items: center; flex-wrap: wrap; max-width: 90%; }
+  .ctrl {
+    background: rgba(47,93,84,.92); color: #fff; border: none; border-radius: 7px;
+    font-size: 13px; padding: 6px 9px; cursor: pointer;
+    display: inline-flex; align-items: center; gap: 4px; backdrop-filter: blur(2px);
+  }
+  .ctrl:hover { background: #3a7166; }
+  .ctrl.listening { background: #c0392b; animation: pulse 1s infinite; }
+  .ctrl.llm-on { background: #6c5ce7; }
+  @keyframes pulse { 0%,100%{ box-shadow:0 0 0 0 rgba(192,57,43,.5);} 50%{ box-shadow:0 0 0 6px rgba(192,57,43,0);} }
+
+  #bubble {
+    position: absolute; right: 12px; top: 12px; left: 12px;
+    background: #fff; color: #243; border-radius: 12px; padding: 10px 12px;
+    font-size: 14px; line-height: 1.5; box-shadow: 0 6px 20px rgba(0,0,0,.15);
+    opacity: 0; transform: translateY(-6px); transition: .25s; pointer-events: none;
+  }
+  #bubble.show { opacity: 1; transform: none; }
+
+  #direct-warn {
+    position: absolute; inset: 0; display: none; align-items: center; justify-content: center;
+    background: #f4f6f8; color: #556; font-size: 15px; text-align: center; padding: 24px;
+  }
+  /* 醫療免責：常駐小字 */
+  #disclaimer {
+    position: absolute; left: 8px; right: 8px; bottom: 44px; text-align: center;
+    font-size: 10px; color: #fff; text-shadow: 0 1px 3px rgba(0,0,0,.65); pointer-events: none;
+  }
+</style>
+</head>
+<body>
+  <div id="stage">
+    <div id="bubble"></div>
+    <canvas id="avatar-canvas"></canvas>
+    <div id="control-bar">
+      <button class="ctrl" id="btn-mic"   title="按一下開始說話">🎤 說話</button>
+      <button class="ctrl" id="btn-llm"   title="啟用瀏覽器內 AI 大腦（首次需下載模型）">🧠</button>
+      <button class="ctrl" id="btn-mute"  title="靜音 / 取消靜音">🔊</button>
+      <button class="ctrl" id="btn-speed" title="語速">1.0×</button>
+      <button class="ctrl" id="btn-close" title="收起">✕</button>
+    </div>
+  </div>
+  <div id="disclaimer">⚠ 示範資訊・非醫療建議</div>
+  <div id="direct-warn">請透過 <code>embed.js</code> 載入此元件。</div>
+
+  <script src="https://cubism.live2d.com/sdk-web/cubismcore/live2dcubismcore.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/pixi.js@6.5.10/dist/browser/pixi.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/pixi-live2d-display@0.4.0/dist/cubism4.min.js"></script>
+  <script src="knowledge.js"></script>
+
+  <!-- M4b：WebLLM（瀏覽器內跑小模型，零金鑰）。用 module 載入，把控制權掛到 window.LLM -->
+  <script type="module">
+    import * as webllm from "https://esm.run/@mlc-ai/web-llm";
+    const LLM_MODEL = "Qwen2.5-1.5B-Instruct-q4f16_1-MLC"; // 中文不錯、約 1.1GB、首次下載後會被快取
+    let engine = null, loadingPromise = null;
+    window.LLM = {
+      supported: ('gpu' in navigator),
+      state: 'idle',        // idle | loading | ready | error
+      progress: 0,
+      model: LLM_MODEL,
+      async load(onProgress) {
+        if (engine) return engine;
+        if (loadingPromise) return loadingPromise;
+        window.LLM.state = 'loading';
+        loadingPromise = webllm.CreateMLCEngine(LLM_MODEL, {
+          initProgressCallback: (p) => { window.LLM.progress = p.progress || 0; if (onProgress) onProgress(p); }
+        }).then((e) => { engine = e; window.LLM.state = 'ready'; return e; })
+          .catch((err) => { window.LLM.state = 'error'; window.LLM.error = String(err); throw err; });
+        return loadingPromise;
+      },
+      async chat(messages) {
+        if (!engine) return null;
+        const r = await engine.chat.completions.create({ messages, temperature: 0.4, max_tokens: 220 });
+        return r && r.choices && r.choices[0] && r.choices[0].message.content;
+      }
+    };
+  </script>
+
+  <script>
+  const MODEL_URL = 'https://cdn.jsdelivr.net/gh/guansss/pixi-live2d-display/test/assets/haru/haru_greeter_t03.model3.json';
+
+  // ===== 模組層狀態 =====
+  let model = null, app = null;
+  let isSpeaking = false, mouthValue = 0, mouthTarget = 0.7;
+  let lipIds = ['ParamMouthOpenY'];
+  let ttsMuted = false, ttsRate = 1.0, ttVoice = null;
+  let audioMouth = 0, useAudioMouth = false, audioCtx = null;
+  let speakSeq = 0, currentSource = null, currentRaf = 0; // 控制「點第二下打斷第一下」
+  const NEURAL_VOICE = 'zh-TW-HsiaoChenNeural'; // 微軟神經語音「曉臻」
+  let recognition = null, listening = false;
+  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+
+  // ===== 防止被直接開（常見網站 widget 的「禁止直接訪問」提示；純 UX，非安全控制），留 ?dev=1 給開發 =====
+  const isEmbedded = window.self !== window.top;
+  const devBypass  = new URLSearchParams(location.search).has('dev');
+  if (!isEmbedded && !devBypass) {
+    document.getElementById('stage').style.display = 'none';
+    document.getElementById('direct-warn').style.display = 'flex';
+  } else {
+    bootAvatar();
+  }
+
+  // ===== 跟父頁溝通 =====
+  function postToParent(type, payload) {
+    try { window.parent.postMessage(Object.assign({ ns: 'avatar-widget', type }, payload || {}), '*'); } catch (e) {}
+  }
+  window.addEventListener('message', (e) => {
+    const d = e.data || {};
+    if (d.ns !== 'avatar-widget-host') return;
+    if (d.type === 'say') speak(String(d.text || '').slice(0, 600));
+    // 注意：不接受用 postMessage 遠端啟動麥克風（listen），避免惡意父頁偷開麥；麥克風只由使用者點擊觸發
+  });
+
+  function showBubble(text) {
+    const b = document.getElementById('bubble');
+    b.textContent = text; b.classList.add('show');
+    clearTimeout(showBubble._t);
+    showBubble._t = setTimeout(() => b.classList.remove('show'), 6000);
+  }
+
+  // ===== TTS：開口說話 + 對嘴 =====
+  function loadVoice() {
+    const vs = speechSynthesis.getVoices();
+    const pick = (re) => vs.find(v => re.test(v.name + ' ' + v.lang) && !/Google/i.test(v.name)); // 避開 Chrome 會靜默失敗的 Google 遠端語音
+    ttVoice =
+         pick(/(HsiaoChen|HsiaoYu|曉臻|曉雨).*zh/i)        // 微軟神經女聲（最自然，若有安裝）
+      || pick(/(Yating|Zhiwei).*zh[-_]TW/i)               // 較新、較不機械的微軟 zh-TW 女聲
+      || pick(/Microsoft.*zh[-_]TW/i)                      // 任何微軟 zh-TW（本地、可靠）
+      || pick(/zh[-_]TW/i)
+      || pick(/^zh/i)
+      || vs.find(v => /zh/i.test(v.lang))
+      || null;
+  }
+  if ('speechSynthesis' in window) { speechSynthesis.onvoiceschanged = loadVoice; loadVoice(); }
+
+  // 中止目前正在講的（神經語音音檔 + 瀏覽器 TTS + 對嘴），給「點第二下打斷第一下」用
+  function stopSpeaking() {
+    try { if ('speechSynthesis' in window) speechSynthesis.cancel(); } catch (e) {}
+    try { clearInterval(speakBrowser._poll); } catch (e) {}
+    if (currentRaf) { cancelAnimationFrame(currentRaf); currentRaf = 0; }
+    if (currentSource) { try { currentSource.onended = null; currentSource.stop(); } catch (e) {} currentSource = null; }
+    isSpeaking = false; useAudioMouth = false; audioMouth = 0;
+  }
+
+  // 對外入口：先試 edge-tts 神經語音(真人感 + 精準對嘴)，失敗自動退回瀏覽器語音
+  function speak(text) {
+    const myseq = ++speakSeq;          // 每次說話一個序號，用來判斷是否已被新點擊取代
+    showBubble(text);
+    postToParent('speaking', { text });
+    if (ttsMuted) return;
+    stopSpeaking();                    // 立刻打斷上一段
+    speakNeural(text, myseq).catch((e) => {
+      if (myseq !== speakSeq) return;  // 已被更新的點擊取代 → 不要退回播放
+      console.warn('神經語音失敗，退回瀏覽器語音：', e && e.message);
+      useAudioMouth = false;
+      speakBrowser(text);
+    });
+  }
+
+  // edge-tts 神經語音：抓 /api/tts 的 MP3，用 Web Audio 播放並以「實際音量」驅動嘴型
+  async function speakNeural(text, seq) {
+    if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    if (audioCtx.state === 'suspended') { try { await audioCtx.resume(); } catch (e) {} }
+    const resp = await fetch('/api/tts?voice=' + encodeURIComponent(NEURAL_VOICE) + '&text=' + encodeURIComponent(text));
+    if (seq !== speakSeq) return;                       // 抓回來時已被新點擊取代 → 放棄（避免重疊）
+    if (!resp.ok) throw new Error('http ' + resp.status);
+    const arr = await resp.arrayBuffer();
+    if (seq !== speakSeq) return;
+    if (arr.byteLength < 800) throw new Error('audio too small');
+    const audioBuf = await audioCtx.decodeAudioData(arr);
+    if (seq !== speakSeq) return;                       // 解碼後最後確認，舊音檔不搶播
+    const src = audioCtx.createBufferSource(); src.buffer = audioBuf;
+    const analyser = audioCtx.createAnalyser(); analyser.fftSize = 256;
+    src.connect(analyser); analyser.connect(audioCtx.destination);
+    const data = new Uint8Array(analyser.fftSize);
+    currentSource = src;
+    useAudioMouth = true; isSpeaking = true;
+    if (model) try { model.motion('Tap'); } catch (e) {}
+    const loop = () => {
+      if (currentSource !== src) return;                // 不是我在播了就停
+      analyser.getByteTimeDomainData(data);
+      let sum = 0; for (let i = 0; i < data.length; i++) { const v = (data[i] - 128) / 128; sum += v * v; }
+      audioMouth = Math.min(1, Math.sqrt(sum / data.length) * 3.4); // RMS 音量 → 開口
+      currentRaf = requestAnimationFrame(loop);
+    };
+    currentRaf = requestAnimationFrame(loop);
+    src.onended = () => {                               // 自然播完才收尾；被打斷時 onended 已被清掉
+      if (currentSource !== src) return;
+      if (currentRaf) { cancelAnimationFrame(currentRaf); currentRaf = 0; }
+      isSpeaking = false; useAudioMouth = false; audioMouth = 0;
+      currentSource = null;
+    };
+    src.start(0);
+  }
+
+  // 後備：瀏覽器內建語音(Yating)。對嘴綁「實際是否在發聲」，不依賴各語音不一致的事件
+  function speakBrowser(text) {
+    if (ttsMuted || !('speechSynthesis' in window)) return;
+    const u = new SpeechSynthesisUtterance(text);
+    if (!ttVoice) loadVoice();
+    if (ttVoice) u.voice = ttVoice;
+    u.lang = (ttVoice && ttVoice.lang) || 'zh-TW';
+    u.rate = ttsRate; u.pitch = 1.0;
+    u.onboundary = () => { mouthTarget = 0.5 + Math.random() * 0.5; };
+    u.onend = () => { isSpeaking = false; clearInterval(speakBrowser._poll); };
+    const fire = () => {
+      speechSynthesis.speak(u);
+      isSpeaking = true; mouthTarget = 0.7; if (model) try { model.motion('Tap'); } catch (e) {}
+      const t0 = performance.now();
+      clearInterval(speakBrowser._poll);
+      speakBrowser._poll = setInterval(() => {
+        const elapsed = performance.now() - t0;
+        const active = speechSynthesis.speaking || speechSynthesis.pending;
+        if ((elapsed > 1000 && !active) || elapsed > 16000) { isSpeaking = false; clearInterval(speakBrowser._poll); }
+      }, 150);
+    };
+    if (speechSynthesis.speaking || speechSynthesis.pending) { speechSynthesis.cancel(); setTimeout(fire, 130); }
+    else fire();
+  }
+
+  // ===== 大腦：M4 檢索 + M4b（WebLLM）生成 =====
+  // 中文不好斷詞，改用「字元 bigram（相鄰兩字）」相似度，對中文很有效、又不用任何函式庫。
+  function bigrams(s) {
+    s = (s || '').toLowerCase().replace(/[\s，。、？！,.?!~～]/g, '');
+    const g = [];
+    for (let i = 0; i < s.length - 1; i++) g.push(s.slice(i, i + 2));
+    if (s.length === 1) g.push(s);
+    return g;
+  }
+  function similarity(query, text) {
+    const A = bigrams(query), B = new Set(bigrams(text));
+    if (!A.length || !B.size) return 0;
+    let hit = 0; for (const x of A) if (B.has(x)) hit++;
+    return hit / Math.sqrt(A.length * B.size);
+  }
+  function scoreEntry(q, e) {
+    let score = Math.max(similarity(q, e.q), similarity(q, e.kw || ''));
+    const terms = (e.kw || '').split(/\s+/).filter(Boolean);
+    for (const t of terms) { if (t.length >= 2 && q.includes(t)) score = Math.max(score, 0.5 + t.length * 0.04); }
+    return score;
+  }
+  function topK(q, k) {
+    return (window.KB || []).map(e => ({ e, s: scoreEntry(q, e) }))
+      .sort((a, b) => b.s - a.s).slice(0, k).filter(x => x.s > 0.05).map(x => x.e);
+  }
+  // 檢索式回答（零金鑰、即時、永遠可用的後備）
+  function brain(qRaw) {
+    const q = (qRaw || '').trim();
+    if (!q) return '我好像沒聽清楚，可以再說一次嗎？';
+    let best = null, bestScore = 0;
+    for (const e of (window.KB || [])) { const s = scoreEntry(q, e); if (s > bestScore) { bestScore = s; best = e; } }
+    if (best && bestScore >= 0.16) return best.a;
+    return '你問的是「' + q + '」對吧？這題我的知識庫還沒收錄～你可以問我健檢方案、預約、報告、費用或檢查注意事項喔。';
+  }
+  // 有啟用 WebLLM 時，用「檢索到的資料 + LLM」生成更自然的回答；否則退回檢索式
+  async function answer(q) {
+    q = (q || '').trim();
+    if (!q) return '我好像沒聽清楚，可以再說一次嗎？';
+    if (window.LLM && window.LLM.state === 'ready') {
+      const ctx = topK(q, 3).map(e => 'Q：' + e.q + '\nA：' + e.a).join('\n---\n');
+      const messages = [
+        { role: 'system', content: '你是親切的「健檢小幫手」（示範用）。請用繁體中文、口語、最多兩三句話簡短回答。優先依據【參考資料】回答；資料沒有的就用常識簡短回應，不確定就老實說不知道，不要編造醫療數據或價格。涉及健康判斷時，請補一句提醒對方「實際情況請諮詢專業醫師」。本資訊僅供參考、非醫療建議。\n\n【參考資料】\n' + (ctx || '（無）') },
+        { role: 'user', content: q }
+      ];
+      try {
+        showBubble('讓我想想…');
+        const out = await window.LLM.chat(messages);
+        if (out && out.trim()) return out.trim();
+      } catch (e) { console.warn('LLM error', e); }
+    }
+    return brain(q);
+  }
+
+  function handleUser(text) {
+    if (text) showBubble('你：' + text);
+    Promise.resolve().then(async () => { speak(await answer(text)); });
+  }
+
+  // ===== STT：聽你說話 =====
+  function setMic(on) {
+    const b = document.getElementById('btn-mic');
+    b.classList.toggle('listening', on);
+    b.textContent = on ? '● 聆聽中' : '🎤 說話';
+  }
+  function startListening() {
+    if (!SR) { speak('你的瀏覽器不支援語音辨識，建議用 Chrome 開喔。'); return; }
+    if (listening && recognition) { recognition.stop(); return; }
+    try { recognition = new SR(); } catch (e) { speak('語音辨識啟動失敗：' + e.message); return; }
+    recognition.lang = 'zh-TW'; recognition.interimResults = true;
+    recognition.continuous = false; recognition.maxAlternatives = 1;
+    recognition.onstart  = () => { listening = true; setMic(true); showBubble('聆聽中…請說話 🎙️'); };
+    recognition.onresult = (e) => {
+      let txt = ''; for (const r of e.results) txt += r[0].transcript;
+      const last = e.results[e.results.length - 1];
+      if (last.isFinal) handleUser(txt.trim());
+      else showBubble('「' + txt + '」…');
+    };
+    recognition.onerror = (e) => { listening = false; setMic(false);
+      showBubble(e.error === 'not-allowed' ? '我需要麥克風權限才能聽你說話喔。' : '沒聽清楚（' + e.error + '），再試一次。'); };
+    recognition.onend   = () => { listening = false; setMic(false); };
+    try { recognition.start(); } catch (e) {}
+  }
+
+  // ===== Live2D 載入 + 對嘴 =====
+  async function bootAvatar() {
+    try {
+      const Live2DModel = PIXI.live2d.Live2DModel;
+      try { Live2DModel.registerTicker(PIXI.Ticker); } catch (e) {}
+
+      app = new PIXI.Application({
+        view: document.getElementById('avatar-canvas'),
+        autoStart: true, backgroundAlpha: 0, antialias: true,
+        resizeTo: document.getElementById('stage'),
+      });
+
+      model = await Live2DModel.from(MODEL_URL);
+      app.stage.addChild(model);
+      model.anchor.set(0.5, 1.0);
+
+      // 關掉 Live2D 模型自帶的（日文）動作語音 — 只保留我們自己的 TTS（兩者來源不同，互不影響）
+      try { if (PIXI.live2d.SoundManager) PIXI.live2d.SoundManager.volume = 0; } catch (e) {}
+      try {
+        const ms = (model.internalModel.settings && model.internalModel.settings.motions) || {};
+        for (const g of Object.keys(ms)) (ms[g] || []).forEach(d => { delete d.Sound; delete d.sound; });
+      } catch (e) {}
+
+      function fit() {
+        const w = app.renderer.width, h = app.renderer.height;
+        const nativeH = (model.internalModel && model.internalModel.height) || 1000;
+        model.scale.set((h / nativeH) * 0.95);
+        model.x = w / 2; model.y = h;
+      }
+      fit(); window.addEventListener('resize', fit);
+
+      try {
+        const groups = (model.internalModel.settings.groups) || [];
+        const g = groups.find(x => (x.Name || '').toLowerCase() === 'lipsync');
+        if (g && g.Ids && g.Ids.length) lipIds = g.Ids;
+      } catch (e) {}
+
+      // 對嘴：攔截 coreModel.update（計算頂點前的最後一刻寫入嘴巴，保證不被 motion/loadParameters 洗掉）
+      try {
+        const core = model.internalModel.coreModel;
+        const origUpdate = core.update.bind(core);
+        core.update = function () {
+          if (isSpeaking && useAudioMouth) {
+            mouthValue += (audioMouth - mouthValue) * 0.5;          // 神經語音：跟真實音量精準對嘴
+          } else if (isSpeaking) {
+            const t = performance.now() / 1000;
+            mouthValue = 0.12 + (0.83 * mouthTarget) * Math.abs(Math.sin(t * 9)); // 瀏覽器語音：假開合
+          } else {
+            mouthValue = Math.max(0, mouthValue - 0.18);
+          }
+          for (const id of lipIds) { try { core.setParameterValueById(id, mouthValue); } catch (e) {} }
+          return origUpdate();
+        };
+      } catch (e) {}
+
+      model.on('hit', () => onTap());
+      document.getElementById('avatar-canvas').addEventListener('pointerdown', onTap);
+
+      setTimeout(() => showBubble('點 🎤 跟我說話；想更聰明可按 🧠 啟用 AI 大腦 👋'), 700);
+      postToParent('ready');
+      window.__avatarModel = model;
+    } catch (err) {
+      console.error(err);
+      postToParent('error', { message: err.message });
+    }
+  }
+
+  function onTap() {
+    if (onTap._lock) return;                 // 去抖：hit 事件與 pointerdown 可能同時觸發
+    onTap._lock = true;
+    setTimeout(() => { onTap._lock = false; }, 400);
+    if (model) try { model.motion('Tap'); } catch (e) {}
+    speak('你好～我是示範用的佔位虛擬人，點下面的麥克風就能跟我說話！');
+  }
+
+  // ===== 控制列 =====
+  document.getElementById('btn-close').onclick = () => postToParent('close');
+  document.getElementById('btn-mic').onclick   = () => startListening();
+  document.getElementById('btn-mute').onclick  = () => {
+    ttsMuted = !ttsMuted;
+    const mb = document.getElementById('btn-mute');
+    mb.textContent = ttsMuted ? '🔇' : '🔊';
+    mb.setAttribute('aria-pressed', String(ttsMuted));
+    if (ttsMuted) stopSpeaking(); // 立刻停掉正在播的（神經語音 + 瀏覽器語音）
+    showBubble(ttsMuted ? '已靜音' : '已開啟語音');
+  };
+  document.getElementById('btn-speed').onclick = () => {
+    const steps = [0.9, 1.0, 1.2, 1.4];
+    ttsRate = steps[(steps.indexOf(ttsRate) + 1) % steps.length] || 1.0;
+    document.getElementById('btn-speed').textContent = ttsRate.toFixed(1) + '×';
+    showBubble('語速：' + ttsRate.toFixed(1) + '×');
+  };
+  document.getElementById('btn-llm').onclick = async () => {
+    const btn = document.getElementById('btn-llm');
+    if (!window.LLM || !window.LLM.supported) { showBubble('這個裝置不支援 WebGPU，先用知識庫模式就好（功能一樣可用）。'); return; }
+    if (window.LLM.state === 'ready')   { showBubble('AI 大腦已啟用，問我問題吧 🧠'); return; }
+    if (window.LLM.state === 'loading') { showBubble('AI 大腦載入中… ' + Math.round(window.LLM.progress * 100) + '%'); return; }
+    showBubble('開始下載 AI 大腦（約 1GB，只需第一次）…');
+    try {
+      await window.LLM.load((p) => { btn.textContent = '🧠 ' + Math.round((p.progress || 0) * 100) + '%'; });
+      btn.textContent = '🧠✓'; btn.classList.add('llm-on');
+      speak('AI 大腦啟用完成，現在我可以聊得更自然囉！');
+    } catch (e) { btn.textContent = '🧠✗'; showBubble('AI 大腦載入失敗：' + (e && e.message || e)); }
+  };
+  </script>
+</body>
+</html>
